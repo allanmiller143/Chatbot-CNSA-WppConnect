@@ -1,0 +1,21 @@
+# Tokens / sessões / dados do WhatsApp
+backend/tokens/
+backend/tokens/**
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Logs e DBs
+*.log
+*.sqlite
+*.db
+
+# SO
+.DS_Store
+Thumbs.db

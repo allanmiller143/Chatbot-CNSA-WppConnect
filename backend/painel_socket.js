@@ -1,0 +1,56 @@
+// painel_socket.js
+const { Server } = require("socket.io");
+
+let ioInstance = null;
+
+function initSocketIO(httpServer) {
+  ioInstance = new Server(httpServer, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    }
+  });
+
+  ioInstance.on("connection", (socket) => {
+    console.log("🖥️ Painel conectado:", socket.id);
+
+    socket.on("request_human_chats", () => {
+      // repassa pedido para backend (se houver listener) - o servidor wppconnect deve emitir human_chats periodicamente
+      if (ioInstance) {
+        // apenas um placeholder: o servidor WPP deve já emitir 'human_chats' quando houver mudança
+        console.log("Painel solicitou atualização de human_chats.");
+      }
+    });
+
+    socket.on("panel_ready", () => {
+      // painel abriu — você pode responder com estado atual se quiser
+      console.log("Painel pronto:", socket.id);
+    });
+  });
+
+  console.log("🔌 Socket.IO do painel inicializado!");
+}
+
+function emitStatus(status) {
+  if (ioInstance) ioInstance.emit("status_update", status);
+}
+
+function emitQR(qr) {
+  if (ioInstance) ioInstance.emit("qr_code", qr);
+}
+
+function emitLog(msg) {
+  if (ioInstance) ioInstance.emit("log", msg);
+}
+
+function emitHumanChats(list) {
+  if (ioInstance) ioInstance.emit("human_chats", list);
+}
+
+module.exports = {
+  initSocketIO,
+  emitStatus,
+  emitQR,
+  emitLog,
+  emitHumanChats
+};
