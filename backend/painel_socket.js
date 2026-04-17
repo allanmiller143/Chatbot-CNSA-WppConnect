@@ -1,7 +1,9 @@
 // painel_socket.js
 const { Server } = require("socket.io");
+const { EventEmitter } = require('events');
 
 let ioInstance = null;
+const panelEvents = new EventEmitter();
 
 function initSocketIO(httpServer) {
   ioInstance = new Server(httpServer, {
@@ -17,8 +19,9 @@ function initSocketIO(httpServer) {
     socket.on("request_human_chats", () => {
       // repassa pedido para backend (se houver listener) - o servidor wppconnect deve emitir human_chats periodicamente
       if (ioInstance) {
-        // apenas um placeholder: o servidor WPP deve já emitir 'human_chats' quando houver mudança
         console.log("Painel solicitou atualização de human_chats.");
+        // notifica listeners internos para que possam sincronizar sob demanda
+        panelEvents.emit('request_human_chats');
       }
     });
 
@@ -47,6 +50,10 @@ function emitHumanChats(list) {
   if (ioInstance) ioInstance.emit("human_chats", list);
 }
 
+function emitFlaskHealth(healthy, message) {
+  if (ioInstance) ioInstance.emit("flask_health", { healthy: !!healthy, message: String(message || '') });
+}
+
 module.exports = {
   initSocketIO,
   emitStatus,
@@ -54,3 +61,7 @@ module.exports = {
   emitLog,
   emitHumanChats
 };
+
+// exporta o EventEmitter para que outros módulos possam escutar pedidos do painel
+module.exports.panelEvents = panelEvents;
+module.exports.emitFlaskHealth = emitFlaskHealth;

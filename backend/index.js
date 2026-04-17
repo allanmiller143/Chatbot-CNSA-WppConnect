@@ -1,22 +1,22 @@
+// wppconnect-app.js
 const wppconnect = require('@wppconnect-team/wppconnect');
-const express = require('express');
 const axios = require('axios');
-const bodyParser = require('body-parser');
+const { emitStatus, emitQR, emitLog, emitHumanChats } = require('./server'); // usamos o servidor para emitir
+// OBS: se você estiver importando de painel_socket.js diretamente, ajuste o caminho
 
-const app = express();
-app.use(bodyParser.json());
-
-// URL DO SEU FLASK
+// URL DO SEU FLASK - ajustar para seu endpoint real (prod/ngrok)
 const FLASK_API_URL =
-  "https://metaphorical-primordially-francesco.ngrok-free.dev/chat";
+  "http://localhost:5000/chat"; // ajuste se necessário
 
-// Variável para armazenar o cliente WPPConnect
 let wppClient = null;
+let human_chats = []; // armazena usuários em atendimento humano (sincronize com Flask quando necessário)
 
-// Função principal para criar e iniciar o cliente WPPConnect
-function createClient( ) {
+/**
+ * Função que cria o cliente WPPConnect (seu código original, com emits)
+ */
+function createClient() {
   console.log("Iniciando tentativa de conexão WPPConnect...");
-  
+
   wppconnect
     .create({
       session: "escola_amparo",
@@ -26,81 +26,104 @@ function createClient( ) {
         console.log("📱 Escaneie o QR Code abaixo para reativar a sessão:");
         console.log(asciiQR);
         console.log("=================================================");
+        try {
+          // envia QR para o painel (se base64 já disponível, use; senão envie ascii na forma que preferir)
+          // wppconnect catchQR pode fornecer o qr em string — aqui assumimos base64 se já for
+          emitQR(qrCode);
+          emitLog("QR Code gerado e enviado ao painel.");
+        } catch (err) {
+          console.error("Erro emitQR:", err.message);
+        }
       },
       statusFind: (status, session) => {
         console.log('Status da Sessão:', status);
-        // Opcional: Adicionar lógica para notificar o usuário ou tentar reconectar
+        emitLog('statusFind: ' + status);
       },
       autoClose: false,
-      // Opções para aumentar a resiliência e persistência da sessão
-      headless: true, // Recomenda-se rodar sem interface gráfica em produção
-      logQR: false, // Evita logar o QR code no console se catchQR já estiver em uso
-      waitForLogin: true, // Espera o login antes de resolver a Promise
-      updatesLog: true, // Loga atualizações importantes
+      headless: true,
+      logQR: false,
+      waitForLogin: true,
+      updatesLog: true
     })
     .then((client) => startBot(client))
     .catch((error) => {
       console.error("❌ ERRO CRÍTICO na inicialização do WPPConnect:", error.message);
+      emitLog("ERRO CRÍTICO na inicialização: " + error.message);
       // Tenta reiniciar o processo após um erro crítico
-      setTimeout(createClient, 10000); // Tenta novamente em 10 segundos
+      setTimeout(createClient, 10000); // Tenta novamente em 10s
     });
 }
 
 function get_human_chats(status){
   if (status === 'MANTIDO_HUMANO') {
     return true;
-  }else{
+  } else {
     return false;
   }
 }
 
-// Inicia o bot
+// sincroniza human_chats com Flask
+async function syncHumanChatsFromFlask() {
+  try {
+    const r = await axios.get("http://localhost:5000/chat/humanChats");
+    if (r.data && r.data.human_chats) {
+      human_chats = r.data.human_chats;
+      emitHumanChats(human_chats);
+      emitLog("Sincronizado human_chats com Flask: " + human_chats.length);
+    }
+  } catch (err) {
+    emitLog("Erro ao sincronizar human_chats do Flask: " + err.message);
+  }
+}
+
 async function startBot(client) {
   wppClient = client;
   console.log("🚀 WPPConnect iniciado com sucesso! Sessão ativa.");
+  emitStatus("CONNECTED");
+  emitLog("WPPConnect iniciado.");
 
-  // =================================================================
-  // 1. TRATAMENTO DE DESCONEXÃO E MUDANÇA DE ESTADO
-  // =================================================================
+  // atualiza lista inicial de human chats
+  syncHumanChatsFromFlask();
+
   client.onStateChange((state) => {
     console.log('Estado da Conexão Alterado:', state);
-    
+    emitStatus(state);
+    emitLog("StateChange: " + state);
+
     if (state === 'CONFLICT') {
-      console.error("🚨 CONFLITO DE SESSÃO: Outro dispositivo abriu o WhatsApp Web. Tentando fechar e reabrir.");
-      client.useHere(); // Tenta assumir a sessão
+      console.error("🚨 CONFLITO DE SESSÃO: Outro dispositivo abriu o WhatsApp Web. Tentando assumir.");
+      client.useHere();
     }
-    
+
     if (state === 'UNPAIRED' || state === 'UNLAUNCHED') {
       console.error("🚨 SESSÃO PERDIDA: Necessário novo QR Code. Reiniciando o processo...");
-      // Força o fechamento e reinicia para gerar um novo QR Code
-      client.close().then(() => createClient());
+      emitLog("Sessão perdida, reiniciando para gerar novo QR.");
+      client.close().then(() => {
+        createClient();
+      });
     }
-    
+
     if (state === 'DISCONNECTED') {
-        console.error("🚨 DESCONECTADO: A conexão foi perdida. O wppconnect tentará reconectar automaticamente.");
+      console.error("🚨 DESCONECTADO: A conexão foi perdida.");
+      emitLog("DESCONEXÃO detectada.");
     }
   });
 
   client.onStreamChange((state) => {
     console.log('Estado do Stream Alterado:', state);
+    emitLog("StreamChange: " + state);
     if (state === 'DISCONNECTED') {
-        console.error("🚨 STREAM DESCONECTADO: O stream de dados foi interrompido. O wppconnect tentará reconectar.");
+      emitLog("STREAM DESCONECTADO.");
     }
   });
-  
-  // =================================================================
-  // 2. TRATAMENTO DE MENSAGENS E ERROS DE API
-  // =================================================================
 
   client.onMessage(async (msg) => {
-    // Verifica se o cliente WPP está ativo antes de processar
     if (!wppClient) {
-        console.error("Cliente WPP não está ativo. Ignorando mensagem.");
-        return;
+      emitLog("Cliente WPP não ativo. Ignorando mensagem.");
+      return;
     }
-    
+
     try {
-      // Ignorar mensagens de grupos ou mídias
       if (!msg.from || msg.isGroupMsg) return;
 
       const userNumber = msg.from.replace("@c.us", "");
@@ -109,71 +132,66 @@ async function startBot(client) {
 
       if (!question) return;
 
-      // --- NOVO TRECHO PARA OBTER O NOME DO USUÁRIO ---
       let userName = "Desconhecido";
       try {
-          const contact = await client.getContact(msg.from);
-          // Prioriza o nome de exibição (pushname), depois o nome registrado, senão usa o número
-          userName = contact.pushname || contact.name || userNumber;
+        const contact = await client.getContact(msg.from);
+        userName = contact.pushname || contact.name || userNumber;
       } catch (contactError) {
-          console.error("❌ ERRO ao obter nome do contato:", contactError.message);
+        emitLog("Erro ao obter contato: " + contactError.message);
       }
-      // ------------------------------------------------
 
-      console.log(`📩 Mensagem recebida de ${userName} (${userNumber}):`, question);
+      emitLog(`Mensagem recebida de ${userName} (${userNumber}): ${question}`);
 
       let botAnswer = "Desculpe, ocorreu um erro desconhecido ao processar sua mensagem.";
       let transfer = false;
-      
+
       try {
-        // Envia a pergunta para a API Flask
         const response = await axios.post(FLASK_API_URL, {
           question,
           user_id: userNumber,
-          user_name: userName, // NOVO CAMPO ENVIADO PARA O FLASK
+          user_name: userName
         });
 
         botAnswer = response.data.answer;
         transfer = get_human_chats(response.data.status);
-        
-        console.log("🤖 Resposta do bot:", botAnswer);
+        emitLog("Resposta do bot obtida do Flask. status=" + response.data.status);
+
+        // se foi transferido, atualiza lista local e emite para painel
+        if (response.data.status === "TRANSFERIDO" || response.data.status === "MANTIDO_HUMANO") {
+          // Pede nova lista ao Flask e emite
+          await syncHumanChatsFromFlask();
+        }
 
       } catch (apiError) {
-        // Tratamento de erro específico para a API Flask
         console.error("❌ ERRO na comunicação com a API Flask:", apiError.message);
-        
-        // Notifica o usuário sobre a falha na API
-        botAnswer = `⚠️ *ERRO DE COMUNICAÇÃO:* Não foi possível conectar com o nosso sistema de inteligência (${FLASK_API_URL}). Por favor, tente novamente mais tarde. Detalhes: ${apiError.message.substring(0, 50)}...`;
-        transfer = false; // Garante que não tentará transferir em caso de falha de API
+        emitLog("Erro comunicação Flask: " + apiError.message.substring(0, 120));
+        botAnswer = `⚠️ ERRO DE COMUNICAÇÃO: Não foi possível conectar com nosso sistema.`;
+        transfer = false;
       }
 
-      // Envia a resposta ao WhatsApp
-      console.log(`tranfer: ${transfer}`);
       if (!transfer) {
-        await client.sendText(msg.from, botAnswer);
+        try {
+          await client.sendText(msg.from, botAnswer);
+          emitLog(`Resposta enviada a ${userNumber}`);
+        } catch (err) {
+          emitLog("Erro ao enviar resposta: " + err.message);
+        }
+      } else {
+        emitLog(`Mensagem transferida para humano: ${userNumber}`);
       }
 
     } catch (err) {
-      // Tratamento de erro geral (ex: falha ao enviar a mensagem de volta)
       console.error("❌ ERRO GERAL ao processar mensagem:", err.message);
-      // Se falhar aqui, é provável que a conexão com o WhatsApp tenha caído
-      // O onStateChange deve capturar isso, mas é bom ter um fallback
+      emitLog("Erro geral onMessage: " + err.message);
       if (err.message.includes('Session not active')) {
-          console.error("Sessão inativa detectada. Aguardando reconexão automática ou reinício.");
+        emitLog("Session not active detectada.");
       }
     }
   });
+
+  // opcional: atualiza human_chats periodicamente (ex: a cada 20s)
+  setInterval(syncHumanChatsFromFlask, 20000);
 }
 
-// Inicia o processo de criação do cliente
+// inicia
 createClient();
-
-// Opcional: Web server para status health-check
-app.get("/", (req, res) => {
-  res.send("Servidor WPPConnect ativo!");
-});
-
-
-app.listen(3000, () => {
-  console.log("HTTP server rodando em http://localhost:3000" );
-});
