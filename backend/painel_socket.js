@@ -6,6 +6,8 @@ let ioInstance = null;
 const panelEvents = new EventEmitter();
 
 function initSocketIO(httpServer) {
+  if (ioInstance) return ioInstance;
+
   ioInstance = new Server(httpServer, {
     cors: {
       origin: "*",
@@ -17,51 +19,67 @@ function initSocketIO(httpServer) {
     console.log("🖥️ Painel conectado:", socket.id);
 
     socket.on("request_human_chats", () => {
-      // repassa pedido para backend (se houver listener) - o servidor wppconnect deve emitir human_chats periodicamente
-      if (ioInstance) {
-        console.log("Painel solicitou atualização de human_chats.");
-        // notifica listeners internos para que possam sincronizar sob demanda
-        panelEvents.emit('request_human_chats');
-      }
+      console.log("Painel solicitou atualização de human_chats.");
+      panelEvents.emit('request_human_chats');
     });
 
     socket.on("panel_ready", () => {
-      // painel abriu — você pode responder com estado atual se quiser
       console.log("Painel pronto:", socket.id);
+      panelEvents.emit('panel_ready');
+    });
+
+    socket.on("disconnect", () => {
+      console.log("🖥️ Painel desconectado:", socket.id);
     });
   });
 
   console.log("🔌 Socket.IO do painel inicializado!");
+  return ioInstance;
+}
+
+function getIO() {
+  return ioInstance;
 }
 
 function emitStatus(status) {
-  if (ioInstance) ioInstance.emit("status_update", status);
+  if (ioInstance) {
+    console.log("Emitting status_update:", status);
+    ioInstance.emit("status_update", status);
+  }
 }
 
 function emitQR(qr) {
-  if (ioInstance) ioInstance.emit("qr_code", qr);
+  if (ioInstance) {
+    console.log("Emitting qr_code");
+    ioInstance.emit("qr_code", qr);
+  }
 }
 
 function emitLog(msg) {
-  if (ioInstance) ioInstance.emit("log", msg);
+  if (ioInstance) {
+    ioInstance.emit("log", msg);
+  }
 }
 
 function emitHumanChats(list) {
-  if (ioInstance) ioInstance.emit("human_chats", list);
+  if (ioInstance) {
+    ioInstance.emit("human_chats", list);
+  }
 }
 
 function emitFlaskHealth(healthy, message) {
-  if (ioInstance) ioInstance.emit("flask_health", { healthy: !!healthy, message: String(message || '') });
+  if (ioInstance) {
+    ioInstance.emit("flask_health", { healthy: !!healthy, message: String(message || '') });
+  }
 }
 
 module.exports = {
   initSocketIO,
+  getIO,
   emitStatus,
   emitQR,
   emitLog,
-  emitHumanChats
+  emitHumanChats,
+  emitFlaskHealth,
+  panelEvents
 };
-
-// exporta o EventEmitter para que outros módulos possam escutar pedidos do painel
-module.exports.panelEvents = panelEvents;
-module.exports.emitFlaskHealth = emitFlaskHealth;

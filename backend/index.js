@@ -1,57 +1,75 @@
-// wppconnect-app.js
+// index.js (wppconnect-app)
 const wppconnect = require('@wppconnect-team/wppconnect');
 const axios = require('axios');
-const { emitStatus, emitQR, emitLog, emitHumanChats } = require('./server'); // usamos o servidor para emitir
-// OBS: se você estiver importando de painel_socket.js diretamente, ajuste o caminho
+const { emitStatus, emitQR, emitLog, emitHumanChats, panelEvents, emitFlaskHealth } = require('./painel_socket');
+const { server } = require('./server'); // Importa o servidor HTTP configurado
 
 // URL DO SEU FLASK - ajustar para seu endpoint real (prod/ngrok)
-const FLASK_API_URL =
-  "http://localhost:5000/chat"; // ajuste se necessário
+const FLASK_API_URL_BASE = "http://localhost:5000";
+const FLASK_API_URL = `${FLASK_API_URL_BASE}/chat`;
 
 let wppClient = null;
-let human_chats = []; // armazena usuários em atendimento humano (sincronize com Flask quando necessário)
+let human_chats = [];
+let isInitializing = false;
 
 /**
- * Função que cria o cliente WPPConnect (seu código original, com emits)
+ * Função que cria o cliente WPPConnect
  */
-function createClient() {
-  console.log("Iniciando tentativa de conexão WPPConnect...");
+async function createClient() {
+  if (isInitializing) return;
+  isInitializing = true;
 
-  wppconnect
-    .create({
+  console.log("Iniciando tentativa de conexão WPPConnect...");
+  emitLog("Iniciando WPPConnect...");
+
+  try {
+    const client = await wppconnect.create({
       session: "escola_amparo",
       catchQR: (qrCode, asciiQR) => {
         console.log("=================================================");
         console.log("🚨 ATENÇÃO: É NECESSÁRIO ESCANEAR O QR CODE!");
-        console.log("📱 Escaneie o QR Code abaixo para reativar a sessão:");
-        console.log(asciiQR);
         console.log("=================================================");
-        try {
-          // envia QR para o painel (se base64 já disponível, use; senão envie ascii na forma que preferir)
-          // wppconnect catchQR pode fornecer o qr em string — aqui assumimos base64 se já for
-          emitQR(qrCode);
-          emitLog("QR Code gerado e enviado ao painel.");
-        } catch (err) {
-          console.error("Erro emitQR:", err.message);
-        }
+        emitQR(qrCode);
+        emitStatus("WAITING_FOR_QR");
+        emitLog("QR Code gerado. Aguardando leitura...");
       },
       statusFind: (status, session) => {
         console.log('Status da Sessão:', status);
-        emitLog('statusFind: ' + status);
+        emitStatus(status);
+        emitLog('Status da Sessão: ' + status);
       },
-      autoClose: false,
+      autoClose: 0,
       headless: true,
       logQR: false,
       waitForLogin: true,
-      updatesLog: true
-    })
-    .then((client) => startBot(client))
-    .catch((error) => {
-      console.error("❌ ERRO CRÍTICO na inicialização do WPPConnect:", error.message);
-      emitLog("ERRO CRÍTICO na inicialização: " + error.message);
-      // Tenta reiniciar o processo após um erro crítico
-      setTimeout(createClient, 10000); // Tenta novamente em 10s
+      updatesLog: false,
+      disableWelcome: true,
+      browserArgs: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ]
     });
+
+    isInitializing = false;
+    startBot(client);
+  } catch (error) {
+    isInitializing = false;
+    console.error("❌ ERRO CRÍTICO na inicialização do WPPConnect:", error.message);
+    emitLog("ERRO CRÍTICO na inicialização: " + error.message);
+    emitStatus("ERROR");
+    
+    // Tenta reiniciar após 10s em caso de falha na criação
+    setTimeout(createClient, 10000);
+  }
+}
+
+function get_human_chats_status(status) {
+  return status === 'MANTIDO_HUMANO' || status === 'TRANSFERIDO';
 }
 
 function get_human_chats(status){
@@ -65,14 +83,21 @@ function get_human_chats(status){
 // sincroniza human_chats com Flask
 async function syncHumanChatsFromFlask() {
   try {
-    const r = await axios.get("http://localhost:5000/chat/humanChats");
+    const r = await axios.get(`${FLASK_API_URL_BASE}/chat/humanChats`);
+
+    emitFlaskHealth(true); 
     if (r.data && r.data.human_chats) {
       human_chats = r.data.human_chats;
       emitHumanChats(human_chats);
-      emitLog("Sincronizado human_chats com Flask: " + human_chats.length);
+      console.log("Sincronizado human_chats com Flask: " + human_chats.length);
     }
   } catch (err) {
-    emitLog("Erro ao sincronizar human_chats do Flask: " + err.message);
+    console.error("Erro ao sincronizar human_chats:", err.message);
+    // Não emite log para o painel se for erro de conexão recusada (Flask offline)
+    emitFlaskHealth(false);
+    if (!err.message.includes('ECONNREFUSED')) {
+        emitLog("Erro ao sincronizar atendimentos: " + err.message);
+    }
   }
 }
 
@@ -80,54 +105,42 @@ async function startBot(client) {
   wppClient = client;
   console.log("🚀 WPPConnect iniciado com sucesso! Sessão ativa.");
   emitStatus("CONNECTED");
-  emitLog("WPPConnect iniciado.");
+  emitLog("WhatsApp conectado e pronto.");
 
-  // atualiza lista inicial de human chats
   syncHumanChatsFromFlask();
+
+  panelEvents.on('request_human_chats', () => {
+    syncHumanChatsFromFlask();
+  });
+
+  panelEvents.on('panel_ready', () => {
+    if (wppClient) {
+      emitStatus("CONNECTED");
+      syncHumanChatsFromFlask();
+    } else {
+        emitStatus("DISCONNECTED");
+    }
+  });
 
   client.onStateChange((state) => {
     console.log('Estado da Conexão Alterado:', state);
     emitStatus(state);
-    emitLog("StateChange: " + state);
+    emitLog("Estado alterado: " + state);
 
-    if (state === 'CONFLICT') {
-      console.error("🚨 CONFLITO DE SESSÃO: Outro dispositivo abriu o WhatsApp Web. Tentando assumir.");
-      client.useHere();
-    }
-
-    if (state === 'UNPAIRED' || state === 'UNLAUNCHED') {
-      console.error("🚨 SESSÃO PERDIDA: Necessário novo QR Code. Reiniciando o processo...");
-      emitLog("Sessão perdida, reiniciando para gerar novo QR.");
-      client.close().then(() => {
-        createClient();
-      });
-    }
-
-    if (state === 'DISCONNECTED') {
-      console.error("🚨 DESCONECTADO: A conexão foi perdida.");
-      emitLog("DESCONEXÃO detectada.");
-    }
-  });
-
-  client.onStreamChange((state) => {
-    console.log('Estado do Stream Alterado:', state);
-    emitLog("StreamChange: " + state);
-    if (state === 'DISCONNECTED') {
-      emitLog("STREAM DESCONECTADO.");
+    if (state === 'CONFLICT' || state === 'UNPAIRED' || state === 'UNLAUNCHED') {
+        wppClient = null;
+        client.close().catch(() => {});
+        setTimeout(createClient, 5000);
     }
   });
 
   client.onMessage(async (msg) => {
-    if (!wppClient) {
-      emitLog("Cliente WPP não ativo. Ignorando mensagem.");
-      return;
-    }
+    if (!wppClient) return;
 
     try {
-      if (!msg.from || msg.isGroupMsg) return;
+      if (!msg.from || msg.isGroupMsg || msg.type === 'status_v3') return;
 
       const userNumber = msg.from.replace("@c.us", "");
-      const user_id = msg.from;
       const question = msg.body?.trim() || "";
 
       if (!question) return;
@@ -136,12 +149,9 @@ async function startBot(client) {
       try {
         const contact = await client.getContact(msg.from);
         userName = contact.pushname || contact.name || userNumber;
-      } catch (contactError) {
-        emitLog("Erro ao obter contato: " + contactError.message);
-      }
+      } catch (e) {}
 
-      emitLog(`Mensagem recebida de ${userName} (${userNumber}): ${question}`);
-
+      emitLog(`Mensagem de ${userName}: ${question.substring(0, 50)}${question.length > 50 ? '...' : ''}`);
       let botAnswer = "Desculpe, ocorreu um erro desconhecido ao processar sua mensagem.";
       let transfer = false;
 
@@ -152,46 +162,40 @@ async function startBot(client) {
           user_name: userName
         });
 
-        botAnswer = response.data.answer;
+        const botAnswer = response.data.answer;
+        const isHuman = get_human_chats_status(response.data.status);
         transfer = get_human_chats(response.data.status);
-        emitLog("Resposta do bot obtida do Flask. status=" + response.data.status);
+
 
         // se foi transferido, atualiza lista local e emite para painel
         if (response.data.status === "TRANSFERIDO" || response.data.status === "MANTIDO_HUMANO") {
           // Pede nova lista ao Flask e emite
           await syncHumanChatsFromFlask();
+        } 
+
+        if (!transfer) {
+          try {
+            await client.sendText(msg.from, botAnswer);
+            emitLog(`Resposta enviada a ${userName}: ${botAnswer.substring(0, 50)}${botAnswer.length > 50 ? '...' : ''}`);
+          } catch (err) {
+            emitLog("Erro ao enviar resposta: " + err.message);
+          }
+        } else {
+          emitLog(`Mensagem transferida para humano: ${userName}`);
         }
 
       } catch (apiError) {
-        console.error("❌ ERRO na comunicação com a API Flask:", apiError.message);
-        emitLog("Erro comunicação Flask: " + apiError.message.substring(0, 120));
-        botAnswer = `⚠️ ERRO DE COMUNICAÇÃO: Não foi possível conectar com nosso sistema.`;
-        transfer = false;
-      }
-
-      if (!transfer) {
-        try {
-          await client.sendText(msg.from, botAnswer);
-          emitLog(`Resposta enviada a ${userNumber}`);
-        } catch (err) {
-          emitLog("Erro ao enviar resposta: " + err.message);
-        }
-      } else {
-        emitLog(`Mensagem transferida para humano: ${userNumber}`);
+        console.error("Erro Flask:", apiError.message);
+        emitLog("Erro na API de resposta (Flask): " + apiError.message);
       }
 
     } catch (err) {
-      console.error("❌ ERRO GERAL ao processar mensagem:", err.message);
-      emitLog("Erro geral onMessage: " + err.message);
-      if (err.message.includes('Session not active')) {
-        emitLog("Session not active detectada.");
-      }
+      console.error("Erro onMessage:", err.message);
     }
   });
 
-  // opcional: atualiza human_chats periodicamente (ex: a cada 20s)
-  setInterval(syncHumanChatsFromFlask, 20000);
+  setInterval(syncHumanChatsFromFlask, 60000);
 }
 
-// inicia
+// Inicia o processo do bot
 createClient();
