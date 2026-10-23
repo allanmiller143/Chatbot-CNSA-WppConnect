@@ -10,7 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@wppconnect-team/wppconnect": "^1.37.8",
+    "@wppconnect-team/wppconnect": "^2.3.5",
     "axios": "^1.13.2",
     "body-parser": "^2.2.1",
     "cors": "^2.8.5",
