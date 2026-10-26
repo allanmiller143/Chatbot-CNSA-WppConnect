@@ -1,11 +1,12 @@
 // index.js (wppconnect-app)
+require('dotenv').config();
 const wppconnect = require('@wppconnect-team/wppconnect');
 const axios = require('axios');
 const { emitStatus, emitQR, emitLog, emitHumanChats, panelEvents, emitFlaskHealth } = require('./painel_socket');
 require('./server'); // Garante que o servidor HTTP + Socket.IO seja iniciado
 
 // URL DO SEU FLASK - ajustar para seu endpoint real (prod/ngrok)
-const FLASK_API_URL_BASE = "http://localhost:5000";
+const FLASK_API_URL_BASE = process.env.FLASK_API_URL_BASE || "http://localhost:5000";
 const FLASK_API_URL = `${FLASK_API_URL_BASE}/chat`;
 
 let wppClient = null;
@@ -43,10 +44,19 @@ function shouldIgnoreMessage(msg) {
 }
 
 /**
- * Status que indicam que o chat está com atendimento humano.
+ * Status que indicam que o chat entrou/está na lista de atendimento humano
+ * (usado para atualizar o painel).
  */
 function isHumanStatus(status) {
   return status === 'MANTIDO_HUMANO' || status === 'TRANSFERIDO';
+}
+
+/**
+ * Status em que o bot deve ficar em silêncio (humano já assumiu).
+ * Em 'TRANSFERIDO' o bot ainda envia a resposta (aviso de transferência).
+ */
+function isBotSilenced(status) {
+  return status === 'MANTIDO_HUMANO';
 }
 
 /**
@@ -61,7 +71,8 @@ async function createClient() {
 
   try {
     const client = await wppconnect.create({
-      session: "escola_amparo",
+      session: process.env.SESSION_NAME || "escola_amparo",
+      folderNameToken: process.env.TOKENS_FOLDER || "./tokens",
       catchQR: (qrCode, asciiQR) => {
         console.log("=================================================");
         console.log("🚨 ATENÇÃO: É NECESSÁRIO ESCANEAR O QR CODE!");
@@ -214,15 +225,15 @@ async function startBot(client) {
 
         const botAnswer = response.data?.answer;
         const status = response.data?.status;
-        const isTransferred = isHumanStatus(status);
 
-        // se foi transferido, atualiza lista local e emite para o painel
-        if (isTransferred) {
+        // se foi transferido (ou já está com humano), atualiza a lista e emite para o painel
+        if (isHumanStatus(status)) {
           await syncHumanChatsFromFlask();
         }
 
-        if (isTransferred) {
-          emitLog(`Mensagem transferida para humano: ${userName}`);
+        // humano já assumiu: bot fica em silêncio
+        if (isBotSilenced(status)) {
+          emitLog(`Mensagem encaminhada ao atendente humano: ${userName}`);
           return;
         }
 
