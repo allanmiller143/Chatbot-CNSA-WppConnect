@@ -1,0 +1,21 @@
+# Sessão do WPPConnect (credenciais do WhatsApp - NUNCA commitar)
+tokens/
+userDataDir/
+
+# Dependências
+node_modules/
+
+# Variáveis de ambiente
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# Sistema operacional / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

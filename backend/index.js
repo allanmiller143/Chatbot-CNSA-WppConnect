@@ -2,7 +2,7 @@
 const wppconnect = require('@wppconnect-team/wppconnect');
 const axios = require('axios');
 const { emitStatus, emitQR, emitLog, emitHumanChats, panelEvents, emitFlaskHealth } = require('./painel_socket');
-const { server } = require('./server'); // Importa o servidor HTTP configurado
+require('./server'); // Garante que o servidor HTTP + Socket.IO seja iniciado
 
 // URL DO SEU FLASK - ajustar para seu endpoint real (prod/ngrok)
 const FLASK_API_URL_BASE = "http://localhost:5000";
@@ -11,6 +11,43 @@ const FLASK_API_URL = `${FLASK_API_URL_BASE}/chat`;
 let wppClient = null;
 let human_chats = [];
 let isInitializing = false;
+let syncInterval = null;
+let panelListenersRegistered = false;
+
+/**
+ * Retorna true se o destino é uma conversa individual (segura para responder).
+ * Bloqueia status@broadcast, listas de transmissão, newsletters e grupos.
+ */
+function isPrivateChat(jid) {
+  return typeof jid === 'string' && (jid.endsWith('@c.us') || jid.endsWith('@lid'));
+}
+
+/**
+ * Retorna true se a mensagem deve ser ignorada pelo bot.
+ */
+function shouldIgnoreMessage(msg) {
+  return (
+    !msg.from ||
+    msg.fromMe ||
+    msg.isGroupMsg ||
+    msg.isStatusV3 ||
+    msg.broadcast ||
+    msg.type === 'status_v3' ||
+    msg.from === 'status@broadcast' ||
+    msg.from.endsWith('@broadcast') ||
+    msg.from.endsWith('@newsletter') ||
+    msg.from.endsWith('@g.us') ||
+    !isPrivateChat(msg.from) ||
+    msg.type !== 'chat' // só texto: em imagem/vídeo o body é base64, não texto
+  );
+}
+
+/**
+ * Status que indicam que o chat está com atendimento humano.
+ */
+function isHumanStatus(status) {
+  return status === 'MANTIDO_HUMANO' || status === 'TRANSFERIDO';
+}
 
 /**
  * Função que cria o cliente WPPConnect
@@ -62,30 +99,18 @@ async function createClient() {
     console.error("❌ ERRO CRÍTICO na inicialização do WPPConnect:", error.message);
     emitLog("ERRO CRÍTICO na inicialização: " + error.message);
     emitStatus("ERROR");
-    
+
     // Tenta reiniciar após 10s em caso de falha na criação
     setTimeout(createClient, 10000);
-  }
-}
-
-function get_human_chats_status(status) {
-  return status === 'MANTIDO_HUMANO' || status === 'TRANSFERIDO';
-}
-
-function get_human_chats(status){
-  if (status === 'MANTIDO_HUMANO') {
-    return true;
-  } else {
-    return false;
   }
 }
 
 // sincroniza human_chats com Flask
 async function syncHumanChatsFromFlask() {
   try {
-    const r = await axios.get(`${FLASK_API_URL_BASE}/chat/humanChats`);
+    const r = await axios.get(`${FLASK_API_URL_BASE}/chat/humanChats`, { timeout: 10000 });
 
-    emitFlaskHealth(true); 
+    emitFlaskHealth(true);
     if (r.data && r.data.human_chats) {
       human_chats = r.data.human_chats;
       emitHumanChats(human_chats);
@@ -93,21 +118,21 @@ async function syncHumanChatsFromFlask() {
     }
   } catch (err) {
     console.error("Erro ao sincronizar human_chats:", err.message);
-    // Não emite log para o painel se for erro de conexão recusada (Flask offline)
-    emitFlaskHealth(false);
+    emitFlaskHealth(false, err.message);
+    // Não emite log para o painel se for conexão recusada (Flask offline)
     if (!err.message.includes('ECONNREFUSED')) {
-        emitLog("Erro ao sincronizar atendimentos: " + err.message);
+      emitLog("Erro ao sincronizar atendimentos: " + err.message);
     }
   }
 }
 
-async function startBot(client) {
-  wppClient = client;
-  console.log("🚀 WPPConnect iniciado com sucesso! Sessão ativa.");
-  emitStatus("CONNECTED");
-  emitLog("WhatsApp conectado e pronto.");
-
-  syncHumanChatsFromFlask();
+/**
+ * Registra os listeners do painel UMA única vez (evita acúmulo em reconexões).
+ * Usam a variável global wppClient, então sempre refletem o cliente atual.
+ */
+function registerPanelListeners() {
+  if (panelListenersRegistered) return;
+  panelListenersRegistered = true;
 
   panelEvents.on('request_human_chats', () => {
     syncHumanChatsFromFlask();
@@ -118,9 +143,30 @@ async function startBot(client) {
       emitStatus("CONNECTED");
       syncHumanChatsFromFlask();
     } else {
-        emitStatus("DISCONNECTED");
+      emitStatus("DISCONNECTED");
     }
   });
+}
+
+function stopSyncInterval() {
+  if (syncInterval) {
+    clearInterval(syncInterval);
+    syncInterval = null;
+  }
+}
+
+async function startBot(client) {
+  wppClient = client;
+  console.log("🚀 WPPConnect iniciado com sucesso! Sessão ativa.");
+  emitStatus("CONNECTED");
+  emitLog("WhatsApp conectado e pronto.");
+
+  registerPanelListeners();
+  syncHumanChatsFromFlask();
+
+  // Garante que exista só um intervalo ativo
+  stopSyncInterval();
+  syncInterval = setInterval(syncHumanChatsFromFlask, 60000);
 
   client.onStateChange((state) => {
     console.log('Estado da Conexão Alterado:', state);
@@ -128,9 +174,10 @@ async function startBot(client) {
     emitLog("Estado alterado: " + state);
 
     if (state === 'CONFLICT' || state === 'UNPAIRED' || state === 'UNLAUNCHED') {
-        wppClient = null;
-        client.close().catch(() => {});
-        setTimeout(createClient, 5000);
+      wppClient = null;
+      stopSyncInterval();
+      client.close().catch(() => {});
+      setTimeout(createClient, 5000);
     }
   });
 
@@ -138,63 +185,72 @@ async function startBot(client) {
     if (!wppClient) return;
 
     try {
-      if (!msg.from || msg.isGroupMsg || msg.type === 'status_v3') return;
+      // Ignora status/stories, broadcasts, newsletters, grupos, mídia e mensagens próprias
+      if (shouldIgnoreMessage(msg)) return;
 
-      const userNumber = msg.from.replace("@c.us", "");
+      const userNumber = msg.from.replace(/@(c\.us|lid)$/, "");
       const question = msg.body?.trim() || "";
 
       if (!question) return;
 
-      let userName = "Desconhecido";
+      let userName = userNumber;
       try {
         const contact = await client.getContact(msg.from);
         userName = contact.pushname || contact.name || userNumber;
       } catch (e) {}
 
       emitLog(`Mensagem de ${userName}: ${question.substring(0, 50)}${question.length > 50 ? '...' : ''}`);
-      let botAnswer = "Desculpe, ocorreu um erro desconhecido ao processar sua mensagem.";
-      let transfer = false;
 
       try {
-        const response = await axios.post(FLASK_API_URL, {
-          question,
-          user_id: userNumber,
-          user_name: userName
-        });
+        const response = await axios.post(
+          FLASK_API_URL,
+          {
+            question,
+            user_id: userNumber,
+            user_name: userName
+          },
+          { timeout: 30000 }
+        );
 
-        const botAnswer = response.data.answer;
-        const isHuman = get_human_chats_status(response.data.status);
-        transfer = get_human_chats(response.data.status);
+        const botAnswer = response.data?.answer;
+        const status = response.data?.status;
+        const isTransferred = isHumanStatus(status);
 
-
-        // se foi transferido, atualiza lista local e emite para painel
-        if (response.data.status === "TRANSFERIDO" || response.data.status === "MANTIDO_HUMANO") {
-          // Pede nova lista ao Flask e emite
+        // se foi transferido, atualiza lista local e emite para o painel
+        if (isTransferred) {
           await syncHumanChatsFromFlask();
-        } 
-
-        if (!transfer) {
-          try {
-            await client.sendText(msg.from, botAnswer);
-            emitLog(`Resposta enviada a ${userName}: ${botAnswer.substring(0, 50)}${botAnswer.length > 50 ? '...' : ''}`);
-          } catch (err) {
-            emitLog("Erro ao enviar resposta: " + err.message);
-          }
-        } else {
-          emitLog(`Mensagem transferida para humano: ${userName}`);
         }
 
+        if (isTransferred) {
+          emitLog(`Mensagem transferida para humano: ${userName}`);
+          return;
+        }
+
+        if (!botAnswer) {
+          emitLog(`Flask não retornou resposta para ${userName}`);
+          return;
+        }
+
+        // Trava de segurança: nunca envia para algo que não seja conversa individual
+        if (!isPrivateChat(msg.from)) {
+          emitLog(`Destino inválido ignorado: ${msg.from}`);
+          return;
+        }
+
+        try {
+          await client.sendText(msg.from, botAnswer);
+          emitLog(`Resposta enviada a ${userName}: ${botAnswer.substring(0, 50)}${botAnswer.length > 50 ? '...' : ''}`);
+        } catch (err) {
+          emitLog("Erro ao enviar resposta: " + err.message);
+        }
       } catch (apiError) {
         console.error("Erro Flask:", apiError.message);
         emitLog("Erro na API de resposta (Flask): " + apiError.message);
       }
-
     } catch (err) {
       console.error("Erro onMessage:", err.message);
     }
   });
-
-  setInterval(syncHumanChatsFromFlask, 60000);
 }
 
 // Inicia o processo do bot
